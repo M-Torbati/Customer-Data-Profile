@@ -1,0 +1,401 @@
+--=============================================================================*/
+CREATE PROCEDURE [customer].[Fill_Customer_Profile_Weekly]
+
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	BEGIN TRY
+
+	EXEC usp_DropAllTemp
+	DROP TABLE IF EXISTS #date;
+
+
+SELECT
+	date_id DateId
+   ,PersianYearMonth YearMonth
+   ,PersianDate 
+   ,PersianYear
+   ,PersianMonthLag,DayLag
+   INTO #date
+FROM [dim_date]  
+
+
+--00:00
+-------------------sales measure-------------------------------
+----#sales----
+--2 years -----
+declare @currentdate  int 
+select @currentdate=convert(nvarchar,  DATEADD(DAY,-750,getdate()),112)     from #date  
+ 
+ 
+
+drop table if exists #salelast24M
+select  customerid
+,ID_Order,ID_Recipient,ID_Application_Type_Finalize
+,PersianDate,YearMonth,CartFinalizeDateId,PersianMonthLag,DayLag
+,Discount_Gift_Amount
+,Discount_Voucher_Amount,VoucherGeneratedCodeId
+,[Gross Margin Fcast],ShipmentCostNet,fcast_operation_cost,NMV_Fcast,Quantity_Order
+into #salelast24M
+from Sales c with (nolock)
+inner join #date d ON c.CartFinalizeDateId = d.dateid
+where d.DateId >=@currentdate and  DigiStatus in (40,50,70) and c.site_id=1 and customer_business_type = 20;
+ 
+--3:38
+
+-------churn-----------
+with lastyear as (
+select distinct customerid
+from #salelast24M
+where daylag between 1 and 365
+),churns as(
+select distinct customerid
+from #salelast24M
+where daylag between 1 and 372)
+select c.customerid  into #churn
+from churns c
+left join lastyear l on c.CustomerID=l.CustomerID
+where l.CustomerID is null
+
+
+Drop table if exists #sales
+select a.*
+,ROW_NUMBER() OVER (ORDER  BY a.pc2  DESC )AS pc2rank 
+,ROW_NUMBER() OVER (ORDER  BY a.pc1  DESC )AS pc1rank 
+,ROW_NUMBER() OVER (ORDER  BY a.nmv  DESC )AS nmvrank 
+,ROW_NUMBER() OVER (ORDER  BY a.Item DESC )AS Itemrank 				
+into #sales
+FROM (
+select customerid
+,sum([Gross Margin Fcast]) pc1
+,sum(isnull([Gross Margin Fcast],0) + isnull(ShipmentCostNet,0) - isnull(fcast_operation_cost, 0)) pc2
+,sum(NMV_Fcast) nmv
+,sum(Quantity_Order) as  Item
+from #salelast24M
+where daylag between 1 and 365
+GROUP BY customerid
+) a ;
+
+
+
+
+Drop table if exists #pretotal
+select  *
+,case when pc2rank=1 then pc2 else SUM(pc2) OVER (ORDER BY pc2rank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)  end  AS  PreviousRunningTotalPC2
+,case when pc1rank=1 then pc1 else SUM(pc1) OVER (ORDER BY pc1rank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)  end  AS  PreviousRunningTotalPC1
+,case when nmvrank=1 then nmv else SUM(nmv) OVER (ORDER BY nmvrank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)  end  AS  PreviousRunningTotalnmv
+,case when Itemrank=1 then Item else SUM(Item) OVER (ORDER BY itemrank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)  end  AS  PreviousRunningTotalitem
+into #pretotal
+from #sales;
+
+
+
+
+drop table if exists #allsales
+select 
+ sum(case when pc1 >0 then pc1 end) pc1
+,sum(case when pc2 >0 then pc2 end) pc2
+,sum(nmv) nmv
+,sum(Item) as  Item
+into #allsales
+from #sales
+;
+
+
+
+Drop table if exists #80user01
+SELECT CustomerID
+,case when p.pc2  <0 then 0 when  PreviousRunningTotalPC2  < a.pc2*0.8  then 2 when p.pc2  >=0 then 1  end pc2status
+,case when p.pc1  <0 then 0 when  PreviousRunningTotalPC1  < a.pc1*0.8  then 2 when p.pc1  >=0 then 1  end pc1status
+,case when p.nmv  <0 then 0 when  PreviousRunningTotalnmv  < a.nmv*0.8  then 2 when p.nmv  >=0 then 1  end nmvstatus
+,case when p.item <0 then 0 when  PreviousRunningTotalitem < a.item*0.8 then 2 when p.item >=0 then 1  end itemstatus
+INTO #80user01
+from #pretotal p
+cross apply #allsales a;
+
+
+
+
+--2:33
+---------------first order-----------------------------
+Drop table if exists #USERS
+select CustomerID INTO #USERS from Customer_Order WHERE Order_RN = 1 AND Site_Id = 1;
+
+
+Drop table if exists #totalORDER
+SELECT C.CustomerID ,
+MIN(CASE WHEN ID_Application_Type_Finalize  IN (2,3) THEN DateTime_CartFinalize END) MINORDERAPP,
+MIN(CASE WHEN ID_Application_Type_Finalize  IN (1,5) THEN DateTime_CartFinalize END) MINORDERWEB,
+MIN(DateTime_CartFinalize) MINORDER,
+MAX(CASE WHEN ID_Application_Type_Finalize  IN (2,3) THEN DateTime_CartFinalize END) MAXORDERAPP,
+MAX(CASE WHEN ID_Application_Type_Finalize  IN (1,5) THEN DateTime_CartFinalize END) MAXORDERWEB,
+MAX(DateTime_CartFinalize) MAXORDER,
+nullif(Sum(case when PersianMonthLag =1  and (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0) then Discount_Voucher_Amount  end ),0)   VoucherUsedAmount1Month,
+nullif(count(distinct case when PersianMonthLag =1 and (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0) then VoucherGeneratedCodeId end),0)  VoucherUsed1Month,
+nullif(count(distinct case when (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0)  then VoucherGeneratedCodeId end),0)   TotalVoucherUsed,
+nullif(Sum(distinct case when (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0)  then Discount_Voucher_Amount end),0)   TotalVoucherUsedAmount,
+max(case when (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0)  then ID_Order end) MaxVoucherorderId,
+--MAX(case when (VoucherGeneratedCodeId is not null or VoucherGeneratedCodeId>0) then DateTime_CartFinalize end) LastVoucherUsedDate,
+max(ID_Order) maxOrderid
+INTO #totalORDER
+from Sales c with (nolock)
+INNER JOIN #USERS U ON  U.CustomerID = C.CustomerID
+inner join #date d ON c.CartFinalizeDateId = d.dateid
+GROUP BY C.CustomerID;
+
+--2:03
+-------- -gift-------
+
+Drop table if exists #gifttrans;
+with gifttrn as (
+SELECT u.CustomerID ,
+count(order_id ) TotalUsedGift,
+sum(debit_amount) TotalUsedAmountGift
+from FactGiftCards fc
+INNER JOIN #USERS U ON  U.CustomerID = fc.CustomerID
+GROUP BY u.CustomerID)
+select CustomerID , TotalUsedGift, TotalUsedAmountGift
+into #gifttrans
+from gifttrn 
+
+--00:00
+----------------location-------
+--------------city----
+Drop table if exists #topusercity;
+with topcity as
+(
+select a.* ,ROW_NUMBER() OVER (partition by customerid ORDER  BY a.#order desc)AS cityrank 			
+FROM (
+select CustomerID,city_id ,count(distinct ID_Order ) #order
+from #salelast24M lm
+INNER DimRecipient AS a
+ON a.RecipientId = lm.ID_Recipient
+group by CustomerID,city_id ) a )
+select distinct CustomerID ,l.city_name_fa City ,l.state_name_fa Province 
+into #topusercity
+from topcity t
+INNER JOIN [DimLocation] l  
+ON t.city_id = l.city_id  and l.city_name_fa not in ( 'hesam','shahrteh' ,'test' ,'test66')
+where t.cityrank =1 
+
+--4:22
+------------Region----
+Drop table if exists #topuserregion;
+with topcity as
+(select a.* ,ROW_NUMBER() OVER (partition by customerid ORDER  BY a.#order desc)AS regionrank 				
+FROM (
+select CustomerID,city_id,district_id, count(distinct ID_Order ) #order
+from #salelast24M lm
+INNER JOIN DimRecipient AS a
+ON a.RecipientId = lm.ID_Recipient
+where district_id is not null
+group by CustomerID,city_id,district_id) a )
+select distinct CustomerID,l.district_name_fa 
+into #topuserregion
+from topcity t
+INNER JOIN [DimLocation] l
+ON t.city_id = l.city_id AND t.district_id = l.district_id 	and l.city_name_fa not in ( 'hesam','shahrteh' ,'test' ,'test66')
+where regionrank =1;
+--00:16
+
+drop table if exists #gender;
+with jobs as(
+SELECT distinct j.[id] userid ,[job_id] ,[title] job_desc
+FROM [users_meta] j
+inner join [user_jobs] jd
+on j.job_id = jd.id and job_id is not null
+)
+select  distinct u.CustomerID  
+,dateadd(year, floor(DATEDIFF(year, date_of_birth, getdate()))+1, date_of_birth) birthdate 
+,isnull(j.job_desc,'') job
+into #gender
+from #USERS u
+inner join DimCustomer cu on cu.UserId = u.CustomerID
+left join jobs j on j.userid = u.CustomerID
+
+
+Drop table if exists #user
+select customerid into #user from (
+      select distinct CustomerID from #totalORDER 
+union select distinct CustomerID from #gifttrans  
+union select distinct CustomerID from #80user01   
+union select distinct CustomerID from #topusercity   
+union select distinct CustomerID from #topuserregion ) a
+
+
+
+ --00:25
+Drop table if exists #finals
+select --count(1)
+u.CustomerID,
+mo.MINORDER				[FirstOrderDate],
+mo.MINORDERAPP				    [FirstOrderDateApplication],
+mo.MINORDERWEB				    [FirstOrderDateWeb],
+case when c.customerid is not null then null else mo.VoucherUsed1Month         end [VoucherUsedOneMonth],
+case when c.customerid is not null then null else mo.VoucherUsedAmount1Month   end [VoucherUsedAmountOneMonth],
+case when c.customerid is not null then null else mo.TotalVoucherUsed			end [TotalVoucherUsed],
+case when c.customerid is not null then null else mo.TotalVoucherUsedAmount	end [TotalVoucherUsedAmount],
+case when c.customerid is not null then null else u8.itemstatus				end 	itemstatus,
+case when c.customerid is not null then null else u8.nmvstatus					end nmvstatus,
+case when c.customerid is not null then null else u8.pc1status					end pc1status,
+case when c.customerid is not null then null else u8.pc2status					end pc2status,
+case when c.customerid is not null then null else gt.TotalUsedAmountGift		end     [TotalUsedAmountGift],
+case when c.customerid is not null then null else gt.TotalUsedGift				end [TotalUsedGift],
+tc.City						[OrderCity],
+tc.Province					[OrderProvince],
+tr.district_name_fa			[OrderRegion],
+g.birthdate                                 [NextBirthDate],
+g.job					    [Job],
+c.customerid                  churn
+Into #finals 
+from #USER u
+inner join #gender g on g.CustomerID = u.CustomerID
+left join #totalORDER mo on u.CustomerID = mo.CustomerID
+left join #80user01 u8 on u.CustomerID = u8.CustomerID
+left join #gifttrans gt on u.CustomerID = gt.CustomerID
+left join #topusercity tc on u.CustomerID = tc.CustomerID
+left join #topuserregion tr on u.CustomerID = tr.CustomerID
+left join #churn c on u.CustomerID = c.CustomerID
+
+-------------my update ----------------- 
+Drop table if exists #customerprofileweekly
+Select [user_id]
+      ,[first_order_date]
+      ,[first_order_date_application]
+      ,[first_order_date_web]
+      ,[next_birthdate]
+      ,[job]
+      ,[voucher_used_previousmonth]        
+      ,[voucher_used_amount_previousMonth]
+      ,[total_voucher_used]
+      ,[total_voucher_used_amount]
+      ,[total_used_amount_gift]
+      ,[total_used_gift]
+      ,cast([item_segmention] as int) [item_segmention]
+      ,cast([Nmv_segmention]  as int) [Nmv_segmention] 
+      ,cast([Pc1_segmention]  as int) [Pc1_segmention] 
+      ,cast([Pc2_segmention]  as int) [Pc2_segmention] 
+      ,[order_city]
+      ,[order_province]
+      ,[order_region]
+      ,[table_status]
+into  #customerprofileweekly
+FROM [customer_profile_weekly]
+ 
+ 
+ 
+TRUNCATE TABLE [customer_profile_weekly];
+insert into [customer_profile_weekly] 
+select  
+       f.CustomerID						[user_id]
+      ,f.[FirstOrderDate]				[first_order_date]
+      ,f.[FirstOrderDateApplication]    [first_order_date_application]
+      ,f.[FirstOrderDateWeb]			[first_order_date_web]
+      ,f.[NextBirthDate]				[next_birthdate]
+      ,f.[Job]							[job]
+      ,f.[VoucherUsedOneMonth]			[voucher_used_previousmonth]
+      ,f.[VoucherUsedAmountOneMonth]    [voucher_used_amount_previousMonth]
+      ,f.[TotalVoucherUsed]				[total_voucher_used]
+      ,f.[TotalVoucherUsedAmount]		[total_voucher_used_amount]
+      ,f.[TotalUsedAmountGift]			[total_used_amount_gift]
+      ,f.[TotalUsedGift]				[total_used_gift]
+      ,f.[ItemStatus]					[item_segmention]
+      ,f.[NmvStatus]					[Nmv_segmention]
+      ,f.[Pc1Status]					[Pc1_segmention]
+      ,f.[Pc2Status]					[Pc2_segmention]
+      ,f.[OrderCity]					[order_city]
+      ,f.[OrderProvince]				[order_province]
+      ,f.[OrderRegion]					[order_region]
+      ,'New'							[table_status]
+from #finals f
+left join #customerprofileweekly  c on f.CustomerID = c.[user_id] 
+where c.[user_id] is null
+
+ 
+ 
+insert into [customer_profile_weekly] 
+select 
+ f.CustomerID						[user_id]
+,f.[FirstOrderDate]				[first_order_date]
+,f.[FirstOrderDateApplication]    [first_order_date_application]
+,f.[FirstOrderDateWeb]			[first_order_date_web]
+,f.[NextBirthDate]				[next_birthdate]
+,f.[Job]							[job]
+,f.[VoucherUsedOneMonth]			[voucher_used_previousmonth]
+,f.[VoucherUsedAmountOneMonth]    [voucher_used_amount_previousMonth]
+,f.[TotalVoucherUsed]				[total_voucher_used]
+,f.[TotalVoucherUsedAmount]		[total_voucher_used_amount]
+,f.[TotalUsedAmountGift]			[total_used_amount_gift]
+,f.[TotalUsedGift]				[total_used_gift]
+,f.[ItemStatus]					[item_segmention]
+,f.[NmvStatus]					[Nmv_segmention]
+,f.[Pc1Status]					[Pc1_segmention]
+,f.[Pc2Status]					[Pc2_segmention]
+,f.[OrderCity]					[order_city]
+,f.[OrderProvince]				[order_province]
+,f.[OrderRegion]				[order_region]
+,'NotUpdated'					[table_status]
+from #finals f
+inner join #customerprofileweekly c 
+on 
+    f.CustomerID										= c.[user_id]
+AND f.[FirstOrderDate]									= c.[first_order_date]
+AND isnull(f.[FirstOrderDateApplication],'1990-01-01')	= isnull(c.[first_order_date_application],'1990-01-01')
+AND isnull(f.[FirstOrderDateWeb],'1990-01-01')			= isnull(c.[first_order_date_web],'1990-01-01')
+AND isnull(f.[NextBirthDate],'1990-01-01')				= isnull(c.[next_birthdate],'1990-01-01')
+AND isnull(f.[Job],'')									= isnull(c.[job],'')
+AND isnull(f.[VoucherUsedOneMonth],-1)					= isnull(c.[voucher_used_previousmonth],-1)
+AND isnull(cast(f.[VoucherUsedAmountOneMonth] as decimal(19,3)),-1)			= isnull(cast(c.[voucher_used_amount_previousMonth] as decimal(19,3)),-1)
+AND isnull(f.[TotalVoucherUsed],-1)						= isnull(c.[total_voucher_used],-1)
+AND isnull(cast(f.[TotalVoucherUsedAmount] as decimal(19,3)),-1)				= isnull(cast(c.[total_voucher_used_amount] as decimal(19,3)),-1)
+AND isnull(cast(f.[TotalUsedAmountGift] as decimal(19,3)),-1)					= isnull(cast(c.[total_used_amount_gift] as decimal(19,3)),-1)
+AND isnull(f.[TotalUsedGift],-1)						= isnull(c.[total_used_gift],-1)
+AND isnull(f.[ItemStatus],-1)							= isnull(cast (c.[item_segmention] as int),-1)
+AND isnull(f.[NmvStatus],-1)							= isnull(cast (c.[Nmv_segmention]  as int),-1)
+AND isnull(f.[Pc1Status],-1)							= isnull(cast (c.[Pc1_segmention]  as int),-1)
+AND isnull(f.[Pc2Status],-1)							= isnull(cast (c.[Pc2_segmention]  as int),-1)
+AND isnull(f.[OrderCity],'')							= isnull(c.[order_city],'')
+AND isnull(f.[OrderProvince],'')						= isnull(c.[order_province],'')
+AND isnull(f.[OrderRegion],'')							= isnull(c.[order_region],'')
+ 				 
+
+insert into [customer_profile_weekly] 
+select 
+ f.CustomerID						[user_id]
+,f.[FirstOrderDate]				[first_order_date]
+,f.[FirstOrderDateApplication]    [first_order_date_application]
+,f.[FirstOrderDateWeb]			[first_order_date_web]
+,f.[NextBirthDate]				[next_birthdate]
+,f.[Job]							[job]
+,f.[VoucherUsedOneMonth]			[voucher_used_previousmonth]
+,f.[VoucherUsedAmountOneMonth]    [voucher_used_amount_previousMonth]
+,f.[TotalVoucherUsed]				[total_voucher_used]
+,f.[TotalVoucherUsedAmount]		[total_voucher_used_amount]
+,f.[TotalUsedAmountGift]			[total_used_amount_gift]
+,f.[TotalUsedGift]				[total_used_gift]
+,f.[ItemStatus]					[item_segmention]
+,f.[NmvStatus]					[Nmv_segmention]
+,f.[Pc1Status]					[Pc1_segmention]
+,f.[Pc2Status]					[Pc2_segmention]
+,f.[OrderCity]					[order_city]
+,f.[OrderProvince]				[order_province]
+,f.[OrderRegion]				[order_region]
+,'Updated'						[table_status]
+from #finals f
+left join [customer_profile_weekly]  c on f.CustomerID = c.user_id 
+where c.[user_id] is null
+
+ 
+
+
+	EXEC usp_DropAllTemp
+		END TRY
+			
+		BEGIN CATCH
+			THROW ;
+		END CATCH
+
+
+END
+GO

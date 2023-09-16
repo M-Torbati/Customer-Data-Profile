@@ -1,0 +1,303 @@
+--=============================================================================*/
+CREATE PROCEDURE [customer].[Fill_Customer_Profile_Daily]
+
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	BEGIN TRY
+
+--EXEC usp_DropAllTemp
+
+DROP TABLE IF EXISTS #date;
+SELECT
+	date_id DateId
+   ,PersianYearMonth YearMonth
+   ,PersianDate 
+   ,PersianYear
+   ,PersianMonthLag,DayLag
+   ,DateString
+   INTO #date
+FROM [dim_date] 
+where DayLag = 1
+
+DROP TABLE IF EXISTS #product; 
+SELECT  [product_id] productid ,[product_name_fa] ProductNameFa,[supply_category_level1_name_en] CategoryLeve1NameFa,[supply_category_level2_name_fa] CategoryLevel2NameFa
+INTO #product
+FROM [dim_product] p
+inner join [dim_category] c on p.category_id = c.category_id
+WHERE 1=1
+
+---------------first order-----------------------------
+Drop table if exists #USERS
+select CustomerID INTO #USERS from Customer_Order WHERE Order_RN = 1 AND Site_Id = 1;
+
+Drop table if exists #totalORDER
+SELECT C.CustomerID ,
+MAX(CASE WHEN ID_Application_Type_Finalize  IN (2,3) THEN DateTime_CartFinalize END) MAXORDERAPP,
+MAX(CASE WHEN ID_Application_Type_Finalize  IN (1,5) THEN DateTime_CartFinalize END) MAXORDERWEB,
+MAX(DateTime_CartFinalize) MAXORDER,
+max(case when (VoucherGeneratedCodeId is not null and VoucherGeneratedCodeId>0)  then ID_Order end) MaxVoucherorderId,
+max(ID_Order) maxOrderid
+INTO #totalORDER
+from Sales c with (nolock)
+INNER JOIN #USERS U ON  U.CustomerID = C.CustomerID
+inner join #date d ON c.CartFinalizeDateId = d.dateid
+GROUP BY C.CustomerID;
+--2:03
+
+-------- -gift-------
+Drop table if exists #gifttrans;
+with gifttrn as (
+SELECT u.CustomerID ,count(order_id ) TotalUsedGift,sum(debit_amount) TotalUsedAmountGift,max(payment_date) LastGiftReedemDate
+from FactGiftCards fc
+INNER JOIN #USERS U ON  U.CustomerID = fc.CustomerID
+inner join #date d on fc.payment_date = d.DateId
+GROUP BY u.CustomerID)
+select CustomerID ,TotalUsedGift ,TotalUsedAmountGift ,CAST(CAST(LastGiftReedemDate AS char(8)) AS datetime) as LastGiftReedemDate
+into #gifttrans
+from gifttrn 
+--00:00
+
+----------voucher--------
+Drop table if exists #vouchers;
+Drop table if exists #voucherorder;
+Drop table if exists #voucher;
+select customerID,MaxVoucherorderId into #voucherorder from #totalORDER where MaxVoucherorderId is not null;
+select VoucherDefineName,VoucherGeneratedCodeId into #voucher from DimVoucher v with (nolock);
+select distinct s.customerID ,v.VoucherDefineName LastVoucherUsedName ,CAST(CAST(o.CartFinalizeDateId AS char(8)) AS datetime ) as LastVoucherUsedDate
+into #vouchers
+from #voucherorder s
+inner join Orders o with (nolock) on o.id_order = s.MaxVoucherorderId
+inner join #voucher v with (nolock) on o.VoucherGeneratedCodeId = v.VoucherGeneratedCodeId
+--00:38
+
+---------lastdevice-----------------
+Drop table if exists #device
+select distinct  c.CustomerID ,a.[ApplicationtypeNameEn] LastPurchasedDevice into #device
+from orders c with (nolock)
+inner join #totalORDER lm on lm.maxOrderid =c.ID_Order
+inner join [DimApplicationType] a on c.ID_Application_Type_Finalize = a.[ApplicationTypeId];
+--00:13
+
+----------#comment-------
+Declare @datestr date;
+select  @datestr =DateString   FROM #date ;
+DROP TABLE IF EXISTS #comment
+SELECT CustomerID, max(created_at) AS LastCommentDate
+INTO #comment
+FROM [comments] c WITH(NOLOCK)
+INNER JOIN #USERS p ON c.user_id=p.CustomerID
+WHERE  is_deleted=0 
+and confirmed_at >= @datestr and confirmed_at < DATEADD(day,1,@datestr)
+GROUP BY CustomerID
+--00:5
+
+-------------club-------------
+Drop table if exists #lastdayclubuser;
+select distinct user_id CustomerID
+into #lastdayclubuser
+FROM [fact_point_transactions]as a
+inner join #date d on a.created_date_id = d.DateId
+;
+Drop table if exists #clubusedpoint;
+select user_id CustomerID,sum(case when [points]<0 then [points] end)ClubPointsUsed,sum([points]) allClubPoints  
+into #clubusedpoint
+FROM [fact_point_transactions]as a
+inner join #lastdayclubuser l on a.user_id = l.CustomerID
+group by user_id
+
+------------------fav list-----------
+Drop table if exists #lastdayfavuser;
+select distinct CustomerID
+into #lastdayfavuser
+FROM [user_favorite_products] f with (nolock)
+INNER JOIN #USERS p ON f.user_id=p.CustomerID
+where  created_at >= @datestr and created_at < DATEADD(day,1,@datestr)
+
+Drop table if exists #fav
+SELECT CustomerID 
+,count(id) AllFavoriteProductCount
+,count(case when [is_deleted]=0 then id end) FavoriteProductCount
+,max(case when [is_deleted]=0 then id end) LastFavoriteProductID
+into #fav
+FROM [user_favorite_products] f with (nolock)
+INNER JOIN #lastdayfavuser p ON f.user_id=p.CustomerID
+GROUP BY CustomerID
+
+Drop table if exists #favarits
+select f.CustomerID,f.FavoriteProductCount,f.AllFavoriteProductCount,uf.created_at LastFavoriteProductDate ,p.ProductNameFa LastFavoriteProductName ,p.productid ,CategoryLevel2NameFa
+into #favarits
+from #fav f
+inner join [user_favorite_products] uf with (nolock) on LastFavoriteProductID = uf.id
+inner join #product p on uf.product_id = p.ProductId;
+--1:30
+
+------------------public list----------
+Drop table if exists #lastdaypublicuser;
+select distinct user_id CustomerID
+into #lastdaypublicuser
+FROM [public_lists] f
+INNER JOIN #USERS p ON f.user_id=p.CustomerID
+where  updated_at >= @datestr and updated_at < DATEADD(day,1,@datestr)
+
+Drop table if exists #list;
+with lastupdate as(
+SELECT CustomerID ,max(updated_at) Lastupdate
+FROM [public_lists] f
+INNER JOIN #lastdaypublicuser p ON f.user_id=p.CustomerID
+GROUP BY CustomerID)
+,list as (
+select l.CustomerID,l.Lastupdate,f.id 
+from [public_lists] f
+inner join lastupdate l on f.user_id = l.CustomerID and f.updated_at = l.Lastupdate)
+select f.CustomerID,f.Lastupdate LastListProductDate, max(uf.id) id
+into #list
+from list f
+inner join [public_list_products] uf on uf.public_list_id = f.id and f.CustomerID = uf.user_id
+group by f.CustomerID,f.Lastupdate
+
+Drop table if exists #userlisd;
+select distinct f.CustomerID,f.LastListProductDate,p.ProductNameFa,p.ProductId,p.CategoryLevel2NameFa
+into #userlisd
+from #list f
+inner join [public_list_products] uf on uf.id = f.id and f.CustomerID = uf.user_id
+inner join #product p on uf.product_id = p.ProductId
+--00:5
+
+Drop table if exists #user
+select customerid into #user from (
+      select distinct CustomerID from #totalORDER 
+union select distinct CustomerID from #gifttrans gt 
+union select distinct CustomerID from #vouchers vo  
+union select distinct CustomerID from #device de  
+union select distinct CustomerID from #comment com
+union select distinct CustomerID from #favarits fav 
+union select distinct CustomerID from #userlisd lis 
+union select distinct CustomerID from #clubusedpoint cl) a
+
+
+Drop table if exists #finals
+select --count(1)
+u.CustomerID,
+isnull(mo.MAXORDER,null)				  [LastOrderDate],
+isnull(mo.MAXORDERAPP,null)				  [LastOrderDateApp],
+isnull(mo.MAXORDERWEB,null)				  [LastOrderDateWeb],
+isnull(gt.LastGiftReedemDate,null)		  [LastGiftReedemDate],
+isnull(vo.LastVoucherUsedDate,null)		  [LastVoucherUsedDate],
+isnull(vo.LastVoucherUsedName,null)		  [LastVoucherUsedName],
+isnull(de.LastPurchasedDevice,null)		  [LastPurchasedDevice],
+isnull(com.LastCommentDate,null)		  [LastCommentDate],
+isnull(fav.FavoriteProductCount,null)	  [FavoriteProductCount],
+isnull(fav.AllFavoriteProductCount,null) -isnull(fav.FavoriteProductCount,null) [RemovedFavoriteProductCount],
+isnull(fav.LastFavoriteProductName,null)  [LastFavoriteProductName],
+isnull(fav.LastFavoriteProductDate,null)  [LastFavoriteProductDate],
+isnull(fav.ProductId,null)                [LastFavoriteProductDKP],
+isnull(fav.CategoryLevel2NameFa,null)     [LastFavoriteProductSubCat],
+isnull(lis.LastListProductDate,null)      [LastListProductDate],
+isnull(lis.ProductNameFa,null)		      [LastListProductName],
+isnull(lis.ProductId,null)    		      [LastListProductDKP],
+isnull(lis.CategoryLevel2NameFa,null)	  [LastListProductSubCat],
+isnull(cl.allClubPoints ,null)			  [allClubPoints],
+isnull(cl.ClubPointsUsed,null)			  [ClubPointsUsed] 
+Into #finals 
+from #USER u
+left join #totalORDER mo on u.CustomerID = mo.CustomerID
+left join #gifttrans gt on u.CustomerID = gt.CustomerID
+left join #vouchers vo on u.CustomerID = vo.CustomerID
+left join #device de on u.CustomerID = de.CustomerID
+left join #comment com on u.CustomerID = com.CustomerID
+left join #favarits fav on u.CustomerID = fav.CustomerID
+left join #userlisd lis on u.CustomerID = lis.CustomerID
+left join #clubusedpoint cl on cl.CustomerID = u.CustomerID
+
+
+---------------merge update--------------
+MERGE [customer_profile_daily] AS t
+USING #finals AS s 
+ON (t.[user_id] = s.CustomerID)
+WHEN MATCHED THEN UPDATE SET 
+	 t.[last_order_date]                   =case when s. [LastOrderDate]               is not null then s.[LastOrderDate]               else t.[last_order_date]                   end
+	,t.[last_order_date_app]			   =case when s. [LastOrderDateApp]			   is not null then s.[LastOrderDateApp]		    else t.[last_order_date_app]			   end
+	,t.[last_order_date_web]			   =case when s. [LastOrderDateWeb]			   is not null then s.[LastOrderDateWeb]		    else t.[last_order_date_web]			   end
+	,t.[last_gift_reedem_date]			   =case when s. [LastGiftReedemDate]		   is not null then s.[LastGiftReedemDate]		    else t.[last_gift_reedem_date]			   end
+	,t.[last_voucher_used_date]			   =case when s. [LastVoucherUsedDate]		   is not null then s.[LastVoucherUsedDate]		    else t.[last_voucher_used_date]			   end
+	,t.[last_voucher_used_name]			   =case when s. [LastVoucherUsedName]		   is not null then s.[LastVoucherUsedName]		    else t.[last_voucher_used_name]			   end
+	,t.[last_purchased_device]			   =case when s. [LastPurchasedDevice]		   is not null then s.[LastPurchasedDevice]		    else t.[last_purchased_device]			   end
+	,t.[last_comment_date]				   =case when s. [LastCommentDate]			   is not null then s.[LastCommentDate]			    else t.[last_comment_date]				   end
+	,t.[favorite_product_count]			   =case when s. [FavoriteProductCount]		   is not null then s.[FavoriteProductCount]	    else t.[favorite_product_count]			   end
+	,t.[removed_favorite_product_count]	   =case when s. [RemovedFavoriteProductCount] is not null then s.[RemovedFavoriteProductCount] else t.[removed_favorite_product_count]	   end
+	,t.[last_favorite_productname]		   =case when s. [LastFavoriteProductName]	   is not null then s.[LastFavoriteProductName]	    else t.[last_favorite_productname]		   end
+	,t.[last_favorite_productdate]		   =case when s. [LastFavoriteProductDate]	   is not null then s.[LastFavoriteProductDate]	    else t.[last_favorite_productdate]		   end
+	,t.[last_favorite_product]			   =case when s. [LastFavoriteProductDKP]	   is not null then s.[LastFavoriteProductDKP]	    else t.[last_favorite_product]			   end
+	,t.[last_favorite_categorylevel2name]  =case when s. [LastFavoriteProductSubCat]   is not null then s.[LastFavoriteProductSubCat]   else t.[last_favorite_categorylevel2name]  end
+	,t.[last_list_product_date]			   =case when s. [LastListProductDate]		   is not null then s.[LastListProductDate]		    else t.[last_list_product_date]			   end
+	,t.[last_list_product_name]			   =case when s. [LastListProductName]		   is not null then s.[LastListProductName]		    else t.[last_list_product_name]			   end
+	,t.[last_list_DKP]					   =case when s. [LastListProductDKP]		   is not null then s.[LastListProductDKP]		    else t.[last_list_DKP]					   end
+	,t.[last_list_categorylevel2name]	   =case when s. [LastListProductSubCat]	   is not null then s.[LastListProductSubCat]	    else t.[last_list_categorylevel2name]	   end
+	,t.[all_club_points]				   =case when s. [allClubPoints]			   is not null then s.[allClubPoints]			    else t.[all_club_points]				   end
+	,t.[club_points_used]				   =case when s. [ClubPointsUsed]			   is not null then s.[ClubPointsUsed]			    else t.[club_points_used]				   end
+	,t.[table_status]					   = 'Updated'
+WHEN NOT MATCHED THEN
+    INSERT (
+	 [user_id]
+	,[last_order_date]
+	,[last_order_date_app]
+	,[last_order_date_web]
+	,[last_gift_reedem_date]
+	,[last_voucher_used_date]
+	,[last_voucher_used_name]
+	,[last_purchased_device]
+	,[last_comment_date]
+	,[favorite_product_count]
+	,[removed_favorite_product_count]
+	,[last_favorite_productname]
+	,[last_favorite_productdate]
+	,[last_favorite_product]
+	,[last_favorite_categorylevel2name]
+	,[last_list_product_date]
+	,[last_list_product_name]
+	,[last_list_DKP]
+	,[last_list_categorylevel2name]
+	,[all_club_points]
+	,[club_points_used]
+	,[table_status]
+	) VALUES (
+	 s.CustomerID
+	,s.[LastOrderDate]
+	,s.[LastOrderDateApp]
+	,s.[LastOrderDateWeb]
+	,s.[LastGiftReedemDate]
+	,s.[LastVoucherUsedDate]
+	,s.[LastVoucherUsedName]
+	,s.[LastPurchasedDevice]
+	,s.[LastCommentDate]
+	,s.[FavoriteProductCount]		  
+	,s.[RemovedFavoriteProductCount]
+	,s.[LastFavoriteProductName]
+	,s.[LastFavoriteProductDate]
+	,s.[LastFavoriteProductDKP]
+	,s.[LastFavoriteProductSubCat]
+	,s.[LastListProductDate]
+	,s.[LastListProductName]
+	,s.[LastListProductDKP]
+	,s.[LastListProductSubCat]
+	,s.[allClubPoints]
+	,s.[ClubPointsUsed]
+	,'New'	
+	)
+	WHEN NOT MATCHED BY SOURCE THEN UPDATE SET 
+	 t.[table_status]					   = 'NotUpdated'
+	;
+	EXEC usp_DropAllTemp
+		END TRY
+			
+		BEGIN CATCH
+			THROW ;
+		END CATCH
+
+
+END
+GO
+
+
